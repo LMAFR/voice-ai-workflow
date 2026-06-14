@@ -4,6 +4,7 @@ vps_backend/vps_config.json
 vps_backend/state.json
 vps_backend/alerts.log
 vps_backend/api.log
+vps_backend/poller.log
 **/.env
 
 # Python
