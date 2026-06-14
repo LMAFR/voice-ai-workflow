@@ -3,6 +3,7 @@ config/repos.json
 vps_backend/vps_config.json
 vps_backend/state.json
 vps_backend/alerts.log
+vps_backend/api.log
 **/.env
 
 # Python
@@ -13,3 +14,6 @@ venv/
 
 # Recorded audio scratch
 *.wav
+
+# Machine-specific deploy (contains secret URL path)
+vps_backend/deploy_local.sh
