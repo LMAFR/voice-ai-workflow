@@ -1,0 +1,5 @@
+# VPS backend uses only the Python standard library.
+# External tools required on the VPS:
+#   - gh   (authenticated: gh auth status)
+#   - git
+#   - tmux (with a running Claude Code session, see start_claude_session.sh)

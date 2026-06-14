@@ -1,0 +1,10 @@
+{
+  "_comment": "Copy to vps_config.json and edit. 'repos' are owner/name strings to watch. 'tmux_session' is the name of the running Claude Code session. 'workdir' is where repo clones + worktrees live.",
+  "repos": [
+    "LMAFR/sunward",
+    "LMAFR/dance-analyzer"
+  ],
+  "tmux_session": "claude-issues",
+  "workdir": "/home/algio/voice-issue-work",
+  "poll_interval": 60
+}

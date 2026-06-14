@@ -1,0 +1,5 @@
+# Local backend dependencies (runs on your local machine)
+# watchdog is optional — without it the watcher falls back to polling.
+watchdog>=3.0.0
+# Also requires the `gh` CLI installed + authenticated (gh auth login),
+# and optionally the `claude` CLI for the formatting step.

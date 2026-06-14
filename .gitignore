@@ -1,0 +1,15 @@
+# Local config and secrets (copy the .example files and edit)
+config/repos.json
+vps_backend/vps_config.json
+vps_backend/state.json
+vps_backend/alerts.log
+**/.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Recorded audio scratch
+*.wav

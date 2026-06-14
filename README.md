@@ -1,0 +1,144 @@
+# voice-issue
+
+Create and resolve GitHub issues by voice.
+
+Speak a request → it's transcribed locally with Whisper → opened as a GitHub
+issue → (optionally) picked up on the VPS by Claude Code, which creates a branch
+and opens a PR that closes the issue.
+
+```
+┌─────────────── your local machine ───────────────┐      ┌──────── the VPS ────────┐
+│                                                   │      │                         │
+│  desktop/voice_issue.py   local_backend/watcher.py│      │ vps_backend/            │
+│  ┌─────────────────┐      ┌──────────────────────┐│      │  issue_poller.py        │
+│  │ record mic      │      │ watch outbox/        ││      │  ┌───────────────────┐  │
+│  │ faster-whisper  │ ───▶ │ (opt.) claude format │├─gh──┼─▶│ poll repos for new│  │
+│  │ write transcript│ JSON │ gh issue create      ││issue │  │ issues            │  │
+│  └─────────────────┘      └──────────────────────┘│      │  │ access ok? ──────┐│  │
+│                                                   │      │  └──────────────┐  ││  │
+└───────────────────────────────────────────────────┘      │     yes ▼       no▼ ││  │
+                                                            │  tmux Claude    email│  │
+                                                            │  worktree+PR    +/retry  │
+                                                            └─────────────────────────┘
+```
+
+## Components
+
+| Path | Runs on | What it does |
+|------|---------|--------------|
+| `desktop/voice_issue.py` | your machine (Win/Linux/Mac) | Record mic, transcribe with faster-whisper, write a transcript JSON to the outbox. |
+| `local_backend/watcher.py` | your machine | Watch the outbox, optionally reformat with a Claude skill, open a GitHub issue via `gh`. |
+| `vps_backend/issue_poller.py` | the VPS | Poll repos for new issues, check token access, dispatch to a Claude Code tmux session (worktree → PR), or email you a `/retry` link if access is missing. |
+| `config/skills/<alias>.md` | your machine | Optional per-repo prompt that formats the transcript into a clean issue. |
+| `vps_backend/skills/<owner>__<repo>.md` | the VPS | Optional per-repo guidance Claude reads before making the PR. |
+
+---
+
+## 1. Local setup (your machine)
+
+### Desktop voice app
+```bash
+cd desktop
+python -m venv .venv && . .venv/bin/activate     # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+# record a message for the "sunward" repo (press Enter to stop):
+python voice_issue.py --repo sunward
+# Spanish, if you prefer to force it:
+python voice_issue.py --repo sunward --lang es
+```
+First run downloads the Whisper `medium` model (~1.5 GB). Set a smaller one with
+`--model small` (or `VOICE_ISSUE_MODEL=small`) if you want it lighter/faster.
+Auto language detection handles English and Spanish; pass `--lang en`/`--lang es`
+to force one.
+
+Transcripts land in `~/.voice-issue/outbox/` (override with `VOICE_ISSUE_OUTBOX`).
+
+### Local backend (outbox → GitHub issue)
+```bash
+# one-time:
+gh auth login                                    # authenticate the gh CLI
+cp config/repos.example.json config/repos.json   # then edit aliases/repos
+pip install -r local_backend/requirements.txt    # watchdog (optional)
+
+# run it (watches forever):
+python local_backend/watcher.py
+# or process the current backlog once:
+python local_backend/watcher.py --once
+# preview without creating issues:
+python local_backend/watcher.py --once --dry-run
+```
+
+`config/repos.json` maps each voice alias to a repo:
+```json
+{
+  "format_enabled": false,
+  "repos": {
+    "sunward": { "repo": "LMAFR/sunward", "labels": ["voice"] },
+    "dance":   { "repo": "LMAFR/dance_analyzer", "labels": ["voice"], "format": "default" }
+  }
+}
+```
+Set `"format_enabled": true` to run the optional Claude formatting step (needs the
+`claude` CLI on PATH and an active subscription). Each repo's `"format"` names a
+prompt file under `config/skills/`. With formatting off, the raw transcript is used.
+
+---
+
+## 2. VPS setup (this server)
+
+```bash
+cd vps_backend
+cp vps_config.example.json vps_config.json        # then edit repos
+# (optional) email alerts — otherwise alerts go to alerts.log:
+cp .env.example .env && edit .env                 # Gmail App Password, etc.
+
+# verify access + setup:
+python issue_poller.py --check
+
+# start the Claude Code session the poller talks to:
+./start_claude_session.sh claude-issues
+
+# run the poller (load .env first if you set up email):
+set -a; [ -f .env ] && . ./.env; set +a
+python issue_poller.py            # poll forever
+python issue_poller.py --once     # single pass
+python issue_poller.py --dry-run  # log only, change nothing
+```
+
+Run it persistently with tmux/systemd, e.g.:
+```bash
+tmux new -d -s issue-poller 'cd ~/voice-issue/vps_backend; set -a; . ./.env 2>/dev/null; set +a; python issue_poller.py'
+```
+
+### What happens per new issue
+1. Poller checks the token can **read + push** the repo (`--check` shows this).
+2. **Access OK** → ensures a clone under `workdir`, labels the issue `claude-wip`,
+   and types a prompt into the `claude-issues` tmux session asking Claude to make a
+   worktree/branch and open a PR that closes the issue.
+3. **No access** → emails `ALERT_EMAIL` a link to the issue. Grant the token access,
+   then comment **`/retry`** on the issue; the poller re-checks and dispatches.
+   (Commenting `/retry` also nudges any stalled task to continue.)
+
+---
+
+## Token permissions (important)
+
+The VPS uses your `gh` token. For the full pipeline the fine-grained PAT needs, on
+the target repos:
+
+- **Contents: Read & write** (clone/push branches) ✅ already enabled
+- **Pull requests: Read & write** (open PRs)
+- **Issues: Read & write** (label issues, and for the local backend to manage them)
+
+> Note: the current token can *create* issues but not *update/close/label* them.
+> The poller treats labeling as best-effort (it won't crash), and dedup falls back
+> to `state.json`, but widen the PAT for labels + auto-PRs to work cleanly. Repos
+> the token can't write trigger the email `/retry` fallback by design.
+
+---
+
+## Files you create (gitignored)
+- `config/repos.json` — alias → repo map (local backend)
+- `vps_backend/vps_config.json` — repos to watch (VPS)
+- `vps_backend/.env` — SMTP creds for email alerts (optional)
+- `vps_backend/state.json` — which issues were handled (auto-managed)
