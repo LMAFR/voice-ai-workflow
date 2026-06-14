@@ -29,6 +29,7 @@ and opens a PR that closes the issue.
 | `desktop/voice_issue.py` | your machine (Win/Linux/Mac) | Record mic, transcribe with faster-whisper, write a transcript JSON to the outbox. |
 | `local_backend/watcher.py` | your machine | Watch the outbox, optionally reformat with a Claude skill, open a GitHub issue via `gh`. |
 | `vps_backend/issue_poller.py` | the VPS | Poll repos for new issues, check token access, dispatch to a Claude Code tmux session (worktree → PR), or email you a `/retry` link if access is missing. |
+| `vps_backend/issue_api.py` | the VPS | HTTP endpoint so an iPhone "Hey Siri" Shortcut can file an issue by voice — no desktop, no Whisper, no token on the phone. |
 | `config/skills/<alias>.md` | your machine | Optional per-repo prompt that formats the transcript into a clean issue. |
 | `vps_backend/skills/<owner>__<repo>.md` | the VPS | Optional per-repo guidance Claude reads before making the PR. |
 
@@ -118,6 +119,49 @@ tmux new -d -s issue-poller 'cd ~/voice-issue/vps_backend; set -a; . ./.env 2>/d
 3. **No access** → emails `ALERT_EMAIL` a link to the issue. Grant the token access,
    then comment **`/retry`** on the issue; the poller re-checks and dispatches.
    (Commenting `/retry` also nudges any stalled task to continue.)
+
+---
+
+## 3. iPhone by voice (Siri Shortcut, no desktop needed)
+
+On iOS you can skip the desktop recorder and Whisper entirely: Apple dictates
+on-device (EN/ES), and `vps_backend/issue_api.py` does the alias lookup, optional
+Claude formatting, and `gh issue create` on the VPS. The phone holds only a shared
+secret — never the GitHub token. The poller then handles the new issue as usual.
+
+### Run the endpoint on the VPS
+```bash
+cd vps_backend
+cp .env.example .env        # set VOICE_ISSUE_API_SECRET (long random string)
+cp ../config/repos.example.json ../config/repos.json   # alias → repo map (shared with the watcher)
+
+set -a; . ./.env; set +a
+python issue_api.py --dry-run     # smoke test, creates nothing
+python issue_api.py               # serve on 127.0.0.1:8787
+```
+It binds to localhost by design — put a TLS reverse proxy in front (nginx) so the
+phone reaches it over HTTPS, e.g. `https://your-host/voice/issue → 127.0.0.1:8787/issue`.
+Run it persistently with tmux/systemd like the poller.
+
+It accepts either a raw spoken `phrase` (parsed server-side) or a pre-split
+`{repo_alias, text}`. Phrase forms understood (case-insensitive):
+`new <alias> issue: <text>` · `new <alias> issue <text>` · `<alias>: <text>` · `<alias> <text>`.
+`GET /health` lists the configured aliases.
+
+### The Shortcut (Shortcuts app)
+1. **Text** action holding your secret → set variable `secret`.
+2. **Dictate Text** → gives `Dictated Text` (say e.g. *"new sunward issue: the login button does nothing"*).
+3. **Get Contents of URL**:
+   - URL `https://your-host/voice/issue`, Method **POST**
+   - Header `Content-Type: application/json`
+   - Request Body **JSON**: `phrase` = Dictated Text, `secret` = the secret variable
+4. (optional) **Show Result** of the response so you see the new issue URL.
+5. Rename the shortcut, e.g. **"New Issue"**, and run it with *"Hey Siri, new issue"* —
+   then speak the `new <alias> issue: …` sentence when it listens.
+
+> Because the alias is spoken inside the dictated sentence, one shortcut covers all
+> repos. (Alternatively make one shortcut per repo with the alias hardcoded for a
+> fully hands-free *"Hey Siri, new sunward issue"*.)
 
 ---
 
