@@ -37,6 +37,7 @@ Usage:
 """
 import argparse
 import hmac
+import difflib
 import json
 import os
 import re
@@ -75,29 +76,98 @@ def load_config() -> dict:
 
 
 # ----------------------------------------------------------------- phrase parse
-# Patterns are tried in order; the first that matches wins. All case-insensitive,
-# DOTALL so multi-sentence dictation flows into the body.
-_PHRASE_PATTERNS = [
-    re.compile(r"^\s*(?:new\s+)?(?P<alias>[\w-]+)\s+issue\s*[:\-]\s*(?P<text>.+)$", re.I | re.S),
-    re.compile(r"^\s*(?:new\s+)?(?P<alias>[\w-]+)\s+issue\s+(?P<text>.+)$", re.I | re.S),
-    re.compile(r"^\s*(?P<alias>[\w-]+)\s*[:\-]\s*(?P<text>.+)$", re.I | re.S),
-    re.compile(r"^\s*(?P<alias>[\w-]+)\s+(?P<text>.+)$", re.I | re.S),
-]
+# Dictation is noisy: it mis-hears "issue" as "IU", wraps words in parens, and
+# garbles invented names. So we tokenize rather than regex-match, drop leading
+# filler + a stray "issue"-ish word, then resolve the alias by exact / number /
+# fuzzy match. A spoken number ("new issue two ...") is an unambiguous override.
+FILLER_LEAD = {"new", "a", "an", "the"}
+ISSUE_WORDS = {"issue", "issues", "iu", "ishu", "ish"}
+# spoken-number homophones -> canonical key looked up in config["numbers"]
+NUMBER_WORDS = {
+    "one": "one", "won": "one", "1": "one",
+    "two": "two", "to": "two", "too": "two", "2": "two",
+    "three": "three", "tree": "three", "free": "three", "3": "three",
+}
 
 
-def parse_phrase(phrase: str) -> tuple[str, str] | None:
-    """Pull (alias, text) out of a spoken sentence, or None if unparseable."""
-    phrase = phrase.strip()
-    for pat in _PHRASE_PATTERNS:
-        m = pat.match(phrase)
-        if m:
-            return m.group("alias").strip(), m.group("text").strip()
-    return None
+def _norm(tok: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", tok.lower())
+
+
+def resolve_alias(token: str, cfg: dict) -> str | None:
+    """Map a spoken/typed token to a canonical repo alias key, via exact match,
+    the number map (one/two/three + homophones), or fuzzy match. None if no hit."""
+    t = _norm(token)
+    if not t:
+        return None
+    repos = cfg.get("repos", {})
+    if t in repos:
+        return t
+    n = NUMBER_WORDS.get(t)
+    numbers = cfg.get("numbers", {})
+    if n and n in numbers and numbers[n] in repos:
+        return numbers[n]
+    m = difflib.get_close_matches(t, list(repos.keys()), n=1, cutoff=0.8)
+    return m[0] if m else None
+
+
+def _is_issue_word(tok: str) -> bool:
+    t = _norm(tok)
+    return t in ISSUE_WORDS or bool(difflib.get_close_matches(t, ["issue"], n=1, cutoff=0.7))
+
+
+def parse_phrase(phrase: str, cfg: dict) -> tuple[str | None, str]:
+    """From a (possibly garbled) dictated sentence return (resolved_alias|None, body).
+    Handles 'new <alias> issue <body>', 'new issue <number> <body>', '<alias>: <body>',
+    stray punctuation/casing, and a mis-heard 'issue' (e.g. 'IU')."""
+    words = re.split(r"\s+", (phrase or "").strip())
+    words = [w for w in words if w]
+    if not words:
+        return None, ""
+    # drop a leading filler word ("new")
+    i = 0
+    while i < len(words) and _norm(words[i]) in FILLER_LEAD:
+        i += 1
+    # drop one "issue"-ish word among the first couple of remaining tokens
+    cleaned: list[str] = []
+    dropped_issue = False
+    for w in words[i:]:
+        if not dropped_issue and len(cleaned) < 2 and _is_issue_word(w):
+            dropped_issue = True
+            continue
+        cleaned.append(w)
+    if not cleaned:
+        return None, ""
+    alias = resolve_alias(cleaned[0], cfg)
+    if alias:
+        body = " ".join(cleaned[1:]).strip().strip(":-").strip()
+        return alias, body
+    # first token isn't a known alias — leave alias unresolved, keep the whole remainder
+    return None, " ".join(cleaned).strip()
 
 
 # --------------------------------------------------------------- issue creation
 def have_claude() -> bool:
     return shutil.which("claude") is not None
+
+
+def _run_claude_json(prompt: str) -> dict | None:
+    """Run `claude -p` and parse its reply as a JSON object. None on any failure."""
+    try:
+        out = subprocess.run(["claude", "-p", prompt, "--output-format", "text"],
+                             capture_output=True, text=True, timeout=180)
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+    if out.returncode != 0:
+        return None
+    raw = out.stdout.strip()
+    if "{" in raw and "}" in raw:  # tolerate ```json fences / surrounding prose
+        raw = raw[raw.find("{"):raw.rfind("}") + 1]
+    try:
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else None
+    except json.JSONDecodeError:
+        return None
 
 
 def format_with_claude(text: str, skill_name: str) -> dict | None:
@@ -107,23 +177,41 @@ def format_with_claude(text: str, skill_name: str) -> dict | None:
         return None
     prompt = (skill_path.read_text(encoding="utf-8")
               + "\n\n--- TRANSCRIPT ---\n" + text + "\n--- END TRANSCRIPT ---\n")
-    try:
-        out = subprocess.run(["claude", "-p", prompt, "--output-format", "text"],
-                             capture_output=True, text=True, timeout=180)
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        return None
-    if out.returncode != 0:
-        return None
-    raw = out.stdout.strip()
-    if raw.startswith("```"):
-        raw = raw.strip("`")
-        raw = raw[raw.find("{"):raw.rfind("}") + 1]
-    try:
-        data = json.loads(raw)
-        if "title" in data and "body" in data:
-            return {"title": str(data["title"]), "body": str(data["body"])}
-    except json.JSONDecodeError:
-        pass
+    data = _run_claude_json(prompt)
+    if data and "title" in data and "body" in data:
+        return {"title": str(data["title"]), "body": str(data["body"])}
+    return None
+
+
+def interpret_with_claude(phrase: str, cfg: dict, fixed_alias: str | None) -> dict | None:
+    """Use Claude to clean a noisy dictation into a GitHub issue, and (only when the
+    repo isn't already known) to pick the target repo. Returns {alias,title,body}."""
+    repos = cfg.get("repos", {})
+    lines, seen = [], set()
+    for alias, entry in repos.items():
+        if entry["repo"] in seen:
+            continue
+        seen.add(entry["repo"])
+        lines.append(f"  {alias}  ->  {entry['repo']}")
+    repo_list = "\n".join(lines)
+    if fixed_alias:
+        repo_instr = (f'The target repo alias is ALREADY chosen: "{fixed_alias}". '
+                      'Return it verbatim as "alias"; do not change it.')
+    else:
+        repo_instr = ('Pick the SINGLE best alias from the list above for where this belongs. '
+                      'If you genuinely cannot tell, use "unknown".')
+    prompt = (
+        "You convert a voice-dictated (often mis-transcribed) phrase into a GitHub issue.\n"
+        "Available repo aliases:\n" + repo_list + "\n\n" + repo_instr + "\n"
+        "Dictation mis-hears words (e.g. 'issue'->'IU'); infer the real intent and write a "
+        "clear, concise issue. Stay faithful — don't invent requirements that aren't implied.\n"
+        'Return ONLY minified JSON: {"alias":"...","title":"...","body":"..."}\n\n'
+        "Dictation:\n" + phrase + "\n"
+    )
+    data = _run_claude_json(prompt)
+    if data and data.get("title") and data.get("body"):
+        return {"alias": str(data.get("alias", "")),
+                "title": str(data["title"]), "body": str(data["body"])}
     return None
 
 
@@ -149,39 +237,60 @@ def create_issue(repo: str, title: str, body: str, labels: list[str]) -> str:
 
 
 def handle_issue(payload: dict, cfg: dict) -> tuple[int, dict]:
-    """Core logic, separated from HTTP so it is unit-testable. Returns (status, body)."""
-    aliases = sorted(cfg.get("repos", {}).keys())
+    """Core logic, separated from HTTP so it is unit-testable. Returns (status, body).
 
-    # Resolve alias + text from either the pre-split fields or a raw phrase.
-    alias = (payload.get("repo_alias") or "").strip()
+    Pipeline: (1) deterministically pull a repo alias + body from the request — a
+    spoken number ("new issue two ...") or a clear word is an unambiguous override;
+    (2) when `interpret_enabled`, ask Claude to clean the (noisy) text into a proper
+    issue, and to pick the repo only if step 1 couldn't; (3) fall back to a per-repo
+    format skill, else the raw text."""
+    repos = cfg.get("repos", {})
+    aliases = sorted(repos.keys())
+
+    explicit = (payload.get("repo_alias") or "").strip()
     text = (payload.get("text") or "").strip()
-    if not (alias and text):
-        parsed = parse_phrase(payload.get("phrase") or "")
-        if not parsed:
-            return 400, {"ok": False, "error": "could not parse phrase; "
-                         "say 'new <alias> issue: <what to file>'", "aliases": aliases}
-        alias, text = parsed
+    if explicit and text:
+        det_alias = resolve_alias(explicit, cfg)
+        body_text = text
+        raw_for_claude = text
+    else:
+        raw_for_claude = (payload.get("phrase") or "").strip()
+        det_alias, body_text = parse_phrase(raw_for_claude, cfg)
 
-    entry = cfg.get("repos", {}).get(alias.lower()) or cfg.get("repos", {}).get(alias)
-    if not entry:
-        return 404, {"ok": False, "error": f"unknown alias '{alias}'", "aliases": aliases}
-    if not text:
-        return 400, {"ok": False, "error": "empty issue text", "aliases": aliases}
+    if not raw_for_claude and not body_text:
+        return 400, {"ok": False, "error": "empty request — nothing dictated", "aliases": aliases}
 
+    # Optional smart interpretation: clean the text and, if needed, choose the repo.
+    interp = None
+    if cfg.get("interpret_enabled") and have_claude() and raw_for_claude:
+        interp = interpret_with_claude(raw_for_claude, cfg, fixed_alias=det_alias)
+
+    final_alias = det_alias or (resolve_alias(interp["alias"], cfg) if interp else None)
+    if not final_alias:
+        return 404, {"ok": False, "aliases": aliases,
+                     "error": "couldn't tell which repo — say e.g. 'new dance issue ...' "
+                              "or use a number 'new issue two ...'"}
+
+    entry = repos[final_alias]
     repo = entry["repo"]
     labels = entry.get("labels", [])
 
-    issue = None
-    if cfg.get("format_enabled") and entry.get("format") and have_claude():
-        issue = format_with_claude(text, entry["format"])
-    if issue is None:
-        issue = raw_issue(text)
+    if interp:
+        issue = {"title": interp["title"], "body": interp["body"]}
+    elif cfg.get("format_enabled") and entry.get("format") and have_claude():
+        issue = format_with_claude(body_text or raw_for_claude, entry["format"]) \
+            or raw_issue(body_text or raw_for_claude)
+    else:
+        if not (body_text or raw_for_claude):
+            return 400, {"ok": False, "error": "empty issue text", "aliases": aliases}
+        issue = raw_issue(body_text or raw_for_claude)
 
     try:
         url = create_issue(repo, issue["title"], issue["body"], labels)
     except RuntimeError as e:
         return 502, {"ok": False, "error": f"gh issue create failed: {e}"}
-    return 200, {"ok": True, "url": url, "repo": repo, "alias": alias, "title": issue["title"]}
+    return 200, {"ok": True, "url": url, "repo": repo, "alias": final_alias,
+                 "title": issue["title"], "interpreted": bool(interp)}
 
 
 # ------------------------------------------------------------------------- HTTP

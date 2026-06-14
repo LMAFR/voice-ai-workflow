@@ -1,19 +1,23 @@
 {
-  "_comment": "Map a short voice-friendly alias to a real GitHub repo. Copy this to repos.json (gitignored) and edit. 'format' is optional: name of a skill file under config/skills/<name>.md used to reformat the transcript with Claude before opening the issue. Omit it (or set format_enabled=false) to open the issue with the raw transcript.",
+  "_comment": "Map a short voice-friendly alias to a real GitHub repo. Copy this to repos.json (gitignored) and edit. 'numbers' maps spoken numbers to an alias for an unambiguous override ('new issue two ...'). 'interpret_enabled' lets Claude clean noisy dictation into a proper issue and pick the repo when it wasn't stated (needs the `claude` CLI). 'format_enabled' + per-repo 'format' is the older skill-based formatter (config/skills/<name>.md); interpret supersedes it when both are on.",
   "format_enabled": false,
+  "interpret_enabled": true,
+  "numbers": { "one": "game", "two": "dance", "three": "studio" },
   "repos": {
-    "studio": {
-      "repo": "LMAFR/rrss_studio",
-      "labels": ["voice", "from-transcript"],
-      "format": "default"
-    },
-    "dance": {
-      "repo": "LMAFR/dance-analyzer",
-      "labels": ["voice"],
-      "format": "default"
+    "game": {
+      "repo": "LMAFR/sunward",
+      "labels": ["voice"]
     },
     "sunward": {
       "repo": "LMAFR/sunward",
+      "labels": ["voice"]
+    },
+    "dance": {
+      "repo": "LMAFR/dance_analyzer",
+      "labels": ["voice"]
+    },
+    "studio": {
+      "repo": "LMAFR/rrss_studio",
       "labels": ["voice"]
     }
   }

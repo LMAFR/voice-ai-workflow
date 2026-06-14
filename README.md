@@ -144,8 +144,19 @@ phone reaches it over HTTPS, e.g. `https://your-host/voice/issue → 127.0.0.1:8
 Run it persistently with tmux/systemd like the poller.
 
 It accepts either a raw spoken `phrase` (parsed server-side) or a pre-split
-`{repo_alias, text}`. Phrase forms understood (case-insensitive):
-`new <alias> issue: <text>` · `new <alias> issue <text>` · `<alias>: <text>` · `<alias> <text>`.
+`{repo_alias, text}`. The phrase parser is built for noisy dictation: it drops a
+leading "new", tolerates a mis-heard "issue" (e.g. "IU"), strips stray punctuation,
+and resolves the alias by exact / number / fuzzy match. Forms understood:
+`new <alias> issue <text>` · `new issue <number> <text>` · `<alias>: <text>` · `<alias> <text>`.
+
+- **Numbers** are an unambiguous override: `new issue two <text>` always files to the
+  alias mapped under `"numbers"` in repos.json (homophones one/won, two/to/too, three/tree
+  are handled). Good when an invented repo name dictates badly.
+- **interpret_enabled** (on by default): the endpoint sends the raw dictation to the
+  `claude` CLI, which cleans it into a proper title+body and — only if you didn't name a
+  repo — picks the best one. A spoken number/word still wins as the repo. If `claude` is
+  unavailable it falls back to the deterministic parse, so an issue is still filed.
+
 `GET /health` lists the configured aliases.
 
 ### The Shortcut (Shortcuts app)
@@ -160,8 +171,9 @@ It accepts either a raw spoken `phrase` (parsed server-side) or a pre-split
    then speak the `new <alias> issue: …` sentence when it listens.
 
 > Because the alias is spoken inside the dictated sentence, one shortcut covers all
-> repos. (Alternatively make one shortcut per repo with the alias hardcoded for a
-> fully hands-free *"Hey Siri, new sunward issue"*.)
+> repos. Say a name (*"new dance issue ..."*) or a number (*"new issue two ..."*); the
+> server interprets the rest. (Alternatively make one shortcut per repo with the alias
+> hardcoded for a fully hands-free *"Hey Siri, new game issue"*.)
 
 ---
 
