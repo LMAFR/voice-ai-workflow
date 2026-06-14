@@ -193,6 +193,49 @@ the target repos:
 
 ---
 
+## Adding a third-party repo (a repo you don't own)
+
+The poller serves any repo listed as a plain `"owner/name"` string with the **default
+token** (your `GH_TOKEN`). To watch a repo owned by someone else, give that one repo
+its own token in `vps_config.json`:
+
+```json
+"repos": [
+  "LMAFR/sunward",
+  { "repo": "someorg/their-repo", "token_env": "THEIR_REPO_TOKEN" }
+]
+```
+
+`token_env` reads the token from the environment (put it in `.env`). You can also
+inline it with `{ "repo": "...", "token": "ghp_..." }` since `vps_config.json` is
+gitignored — but `token_env` keeps secrets in one place. `--check` shows which token
+serves each repo (`token=default` vs `token=env:THEIR_REPO_TOKEN`).
+
+The default-token path is unchanged: omit any token and the repo behaves exactly as
+before.
+
+### REQUIRED security rules for third-party repos
+
+Follow **all** of these whenever you add a repo you don't own:
+
+1. **Get the token from the repo OWNER, scoped to that repo only.** A GitHub
+   *fine-grained* PAT can only reach repos owned by the token's own account — yours
+   cannot touch their repo even if they add you as a collaborator. Ask the owner to
+   mint a fine-grained PAT scoped to **just their one repo**, with **Issues: Read &
+   write** and **Pull requests: Read & write** and nothing else. (A classic PAT with
+   collaborator access works too but is far broader — avoid it.)
+2. **Least privilege.** One repo, Issues + PRs only. Never `Contents`-wide org tokens
+   or anything that can reach other repos.
+3. **Never commit a token.** `vps_config.json` and `.env` are gitignored; the public
+   repo must never receive a token. Per-repo token files the poller writes for the
+   Claude session live under `workdir/.tokens/*.token`, chmod **600**, outside the repo.
+4. **Keep `.env` at chmod 600.** It holds the tokens.
+5. **You are custodian of someone else's write credential.** Treat it accordingly:
+   rotate/remove it when the collaboration ends, and prefer the owner revoking it
+   on their side.
+
+---
+
 ## Files you create (gitignored)
 - `config/repos.json` — alias → repo map (local backend)
 - `vps_backend/vps_config.json` — repos to watch (VPS)

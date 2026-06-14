@@ -1,8 +1,10 @@
 {
-  "_comment": "Copy to vps_config.json and edit. 'repos' are owner/name strings to watch. 'tmux_session' is the name of the running Claude Code session. 'workdir' is where repo clones + worktrees live.",
+  "_comment": "Copy to vps_config.json and edit. Each 'repos' entry is EITHER an 'owner/name' string (served by the default GH_TOKEN, i.e. your token) OR an object for a repo that needs a different token. 'tmux_session' is the running Claude Code session. 'workdir' is where clones + worktrees (and 0600 per-repo token files) live.",
+  "_third_party_comment": "For a repo you do NOT own, ask its OWNER to mint a fine-grained PAT scoped to that single repo (Issues + Pull requests: Read & write) and use {'repo': 'their/repo', 'token_env': 'THEIR_TOKEN'} with the token in .env, OR {'repo': 'their/repo', 'token': 'ghp_...'} inline (vps_config.json is gitignored). Never commit a token. See README 'Adding a third-party repo'.",
   "repos": [
     "LMAFR/sunward",
-    "LMAFR/dance-analyzer"
+    "LMAFR/dance-analyzer",
+    { "repo": "someorg/their-repo", "token_env": "THEIR_REPO_TOKEN" }
   ],
   "tmux_session": "claude-issues",
   "workdir": "/home/algio/voice-issue-work",

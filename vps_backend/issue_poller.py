@@ -52,63 +52,88 @@ def log(msg: str):
 
 
 # --------------------------------------------------------------------------- gh
-def gh_json(args: list[str]):
-    res = subprocess.run(["gh", *args], capture_output=True, text=True)
+def gh_env(token: str | None):
+    """Environment for a gh/git call. None -> inherit (the default GH_TOKEN already
+    in the process env is used). A token -> override GH_TOKEN/GITHUB_TOKEN for that
+    one call, so a repo can be served by a token other than our default."""
+    if not token:
+        return None
+    env = os.environ.copy()
+    env["GH_TOKEN"] = token
+    env["GITHUB_TOKEN"] = token
+    return env
+
+
+def gh_json(args: list[str], token: str | None = None):
+    res = subprocess.run(["gh", *args], capture_output=True, text=True, env=gh_env(token))
     if res.returncode != 0:
         raise RuntimeError(res.stderr.strip() or f"gh {' '.join(args)} failed")
     return json.loads(res.stdout) if res.stdout.strip() else None
 
 
-def gh_run(args: list[str], check=True):
-    res = subprocess.run(["gh", *args], capture_output=True, text=True)
+def gh_run(args: list[str], check=True, token: str | None = None):
+    res = subprocess.run(["gh", *args], capture_output=True, text=True, env=gh_env(token))
     if check and res.returncode != 0:
         raise RuntimeError(res.stderr.strip() or f"gh {' '.join(args)} failed")
     return res
 
 
-def authed_login() -> str:
+def authed_login(token: str | None = None) -> str:
     # --jq on a bare string yields unquoted text, so read it raw rather than as JSON.
-    res = gh_run(["api", "user", "--jq", ".login"], check=False)
+    res = gh_run(["api", "user", "--jq", ".login"], check=False, token=token)
     return res.stdout.strip() if res.returncode == 0 else ""
 
 
-def repo_access(repo: str) -> dict:
+_login_cache: dict[str, str] = {}
+
+
+def login_for(token: str | None) -> str:
+    """The GitHub login the given token authenticates as (cached). For our default
+    token this is the account that owns it; for a third-party token it is whoever
+    minted it — which is exactly who would grant access and comment /retry."""
+    key = token or "__default__"
+    if key not in _login_cache:
+        _login_cache[key] = authed_login(token)
+    return _login_cache[key]
+
+
+def repo_access(repo: str, token: str | None = None) -> dict:
     """Return {'read': bool, 'write': bool, 'error': str|None}."""
     try:
-        perms = gh_json(["api", f"repos/{repo}", "--jq", "{push: .permissions.push, pull: .permissions.pull}"])
+        perms = gh_json(["api", f"repos/{repo}", "--jq", "{push: .permissions.push, pull: .permissions.pull}"], token=token)
     except RuntimeError as e:
         return {"read": False, "write": False, "error": str(e)}
     return {"read": bool(perms.get("pull")), "write": bool(perms.get("push")), "error": None}
 
 
-def list_open_issues(repo: str) -> list[dict]:
+def list_open_issues(repo: str, token: str | None = None) -> list[dict]:
     # exclude PRs (gh issue list already excludes them)
     return gh_json([
         "issue", "list", "--repo", repo, "--state", "open",
         "--json", "number,title,url,labels,updatedAt", "--limit", "50",
-    ]) or []
+    ], token=token) or []
 
 
-def list_comments(repo: str, number: int) -> list[dict]:
+def list_comments(repo: str, number: int, token: str | None = None) -> list[dict]:
     data = gh_json(["api", f"repos/{repo}/issues/{number}/comments",
-                    "--jq", "[.[] | {id, body, login: .user.login}]"])
+                    "--jq", "[.[] | {id, body, login: .user.login}]"], token=token)
     return data or []
 
 
-def ensure_label(repo: str, label: str):
+def ensure_label(repo: str, label: str, token: str | None = None):
     if DRY_RUN:
         return
     gh_run(["label", "create", label, "--repo", repo, "--force",
             "--color", "5319e7", "--description", "handled by voice-issue VPS backend"],
-           check=False)
+           check=False, token=token)
 
 
-def add_label(repo: str, number: int, label: str):
+def add_label(repo: str, number: int, label: str, token: str | None = None):
     if DRY_RUN:
         log(f"  [dry-run] would label #{number} '{label}'")
         return
-    ensure_label(repo, label)
-    gh_run(["issue", "edit", str(number), "--repo", repo, "--add-label", label], check=False)
+    ensure_label(repo, label, token)
+    gh_run(["issue", "edit", str(number), "--repo", repo, "--add-label", label], check=False, token=token)
 
 
 # ---------------------------------------------------------------------- clone
@@ -116,18 +141,34 @@ def repo_slug(repo: str) -> str:
     return repo.replace("/", "__")
 
 
-def ensure_clone(repo: str, workdir: Path) -> Path:
+def ensure_clone(repo: str, workdir: Path, token: str | None = None) -> Path:
     dest = workdir / repo_slug(repo)
     if dest.exists():
         subprocess.run(["git", "-C", str(dest), "fetch", "--all", "--prune"],
-                       capture_output=True, text=True)
+                       capture_output=True, text=True, env=gh_env(token))
         return dest
     workdir.mkdir(parents=True, exist_ok=True)
     res = subprocess.run(["gh", "repo", "clone", repo, str(dest)],
-                         capture_output=True, text=True)
+                         capture_output=True, text=True, env=gh_env(token))
     if res.returncode != 0:
         raise RuntimeError(f"clone failed: {res.stderr.strip()}")
     return dest
+
+
+def write_token_file(workdir: Path, repo: str, token: str) -> Path:
+    """Persist a repo's token to a 0600 file so the Claude session can source it
+    for its own git/gh commands without the secret ever appearing in the tmux
+    prompt (and thus the scrollback/logs)."""
+    tdir = workdir / ".tokens"
+    tdir.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(tdir, 0o700)
+    except OSError:
+        pass
+    path = tdir / f"{repo_slug(repo)}.token"
+    path.write_text(token, encoding="utf-8")
+    os.chmod(path, 0o600)
+    return path
 
 
 # ----------------------------------------------------------------------- tmux
@@ -136,15 +177,28 @@ def tmux_session_exists(session: str) -> bool:
                           capture_output=True).returncode == 0
 
 
-def dispatch_to_claude(session: str, repo: str, number: int, url: str, clone_dir: Path):
+def dispatch_to_claude(session: str, repo: str, number: int, url: str, clone_dir: Path,
+                       token_file: Path | None = None):
     # Optional per-repo skill/agent instructions: vps_backend/skills/<owner__name>.md
     skill = HERE / "skills" / f"{repo_slug(repo)}.md"
     skill_clause = (
         f"Before starting, read the repo-specific instructions in {skill}. "
         if skill.exists() else ""
     )
+    # Repos served by a non-default token: the Claude session must use THAT token for
+    # all git/gh commands, otherwise it would push with our default token and 403.
+    # The token is read from a 0600 file rather than passed inline so it never lands
+    # in the tmux prompt/scrollback.
+    token_clause = (
+        f"IMPORTANT: this repo requires a specific GitHub token. Before running ANY git "
+        f"or gh command for it, in the same shell run: "
+        f'export GH_TOKEN="$(cat {token_file})"; export GITHUB_TOKEN="$GH_TOKEN". '
+        f"Never print, echo, or paste the token itself. "
+        if token_file else ""
+    )
     prompt = (
         f"Please resolve GitHub issue {url} (repo {repo}). "
+        f"{token_clause}"
         f"First read it: `gh issue view {number} --repo {repo}`. "
         f"{skill_clause}"
         f"A clone of the repo is at {clone_dir}. "
@@ -234,27 +288,31 @@ def set_issue_state(state: dict, repo: str, number: int, **kw):
 
 
 # ----------------------------------------------------------------------- core
-def try_dispatch(repo: str, issue: dict, cfg: dict, state: dict, owner_login: str) -> str:
+def try_dispatch(entry: dict, issue: dict, cfg: dict, state: dict) -> str:
+    repo, token = entry["repo"], entry.get("token")
+    owner_login = login_for(token)
     number, url = issue["number"], issue["url"]
-    acc = repo_access(repo)
+    acc = repo_access(repo, token)
     if not acc["read"] or not acc["write"]:
         reason = acc["error"] or (
             "token has read but not write (push)" if acc["read"] else "token cannot read the repo"
         )
         log(f"  no access to {repo} ({reason}) -> emailing alert")
         send_alert(repo, number, url, reason)
-        set_issue_state(state, repo, number, status="awaiting_access", last_retry_comment=last_retry_id(repo, number, owner_login))
+        set_issue_state(state, repo, number, status="awaiting_access", last_retry_comment=last_retry_id(repo, number, owner_login, token))
         return "awaiting_access"
+    workdir = Path(cfg["workdir"]).expanduser()
     try:
-        clone_dir = ensure_clone(repo, Path(cfg["workdir"]).expanduser())
+        clone_dir = ensure_clone(repo, workdir, token)
     except RuntimeError as e:
         log(f"  clone failed ({e}) -> emailing alert")
         send_alert(repo, number, url, str(e))
         set_issue_state(state, repo, number, status="awaiting_access")
         return "awaiting_access"
-    ok = dispatch_to_claude(cfg["tmux_session"], repo, number, url, clone_dir)
+    token_file = write_token_file(workdir, repo, token) if token else None
+    ok = dispatch_to_claude(cfg["tmux_session"], repo, number, url, clone_dir, token_file)
     if ok:
-        add_label(repo, number, WIP_LABEL)
+        add_label(repo, number, WIP_LABEL, token)
         set_issue_state(state, repo, number, status="dispatched")
         log(f"  ✅ dispatched #{number} to Claude session '{cfg['tmux_session']}'")
         return "dispatched"
@@ -262,10 +320,10 @@ def try_dispatch(repo: str, issue: dict, cfg: dict, state: dict, owner_login: st
     return "pending_session"
 
 
-def last_retry_id(repo: str, number: int, owner_login: str) -> int:
+def last_retry_id(repo: str, number: int, owner_login: str, token: str | None = None) -> int:
     """Highest comment id from the owner that contains /retry (0 if none)."""
     try:
-        comments = list_comments(repo, number)
+        comments = list_comments(repo, number, token)
     except RuntimeError:
         return 0
     ids = [c["id"] for c in comments
@@ -274,10 +332,12 @@ def last_retry_id(repo: str, number: int, owner_login: str) -> int:
     return max(ids) if ids else 0
 
 
-def poll_once(cfg: dict, state: dict, owner_login: str):
-    for repo in cfg["repos"]:
+def poll_once(cfg: dict, state: dict):
+    for entry in cfg["repos"]:
+        repo, token = entry["repo"], entry.get("token")
+        owner_login = login_for(token)
         try:
-            issues = list_open_issues(repo)
+            issues = list_open_issues(repo, token)
         except RuntimeError as e:
             log(f"! cannot list issues for {repo}: {e}")
             continue
@@ -290,16 +350,16 @@ def poll_once(cfg: dict, state: dict, owner_login: str):
             status = st.get("status")
 
             if status == "awaiting_access":
-                newest = last_retry_id(repo, number, owner_login)
+                newest = last_retry_id(repo, number, owner_login, token)
                 if newest and newest != st.get("last_retry_comment", 0):
                     log(f"{repo}#{number}: new /retry detected -> re-checking access")
-                    try_dispatch(repo, issue, cfg, state, owner_login)
+                    try_dispatch(entry, issue, cfg, state)
                 continue
 
             if status in ("dispatched", "pending_session"):
                 if status == "pending_session":  # session was down before; try again
                     log(f"{repo}#{number}: retrying dispatch (session may be up now)")
-                    try_dispatch(repo, issue, cfg, state, owner_login)
+                    try_dispatch(entry, issue, cfg, state)
                 continue
 
             if WIP_LABEL in labels:
@@ -309,20 +369,48 @@ def poll_once(cfg: dict, state: dict, owner_login: str):
 
             # brand-new issue
             log(f"{repo}#{number}: new open issue '{issue['title']}'")
-            try_dispatch(repo, issue, cfg, state, owner_login)
+            try_dispatch(entry, issue, cfg, state)
     save_state(state)
 
 
 def cmd_check(cfg: dict):
     print("Access check (token can read + push?):")
-    for repo in cfg["repos"]:
-        acc = repo_access(repo)
+    for entry in cfg["repos"]:
+        repo, token = entry["repo"], entry.get("token")
+        acc = repo_access(repo, token)
         mark = "✅" if (acc["read"] and acc["write"]) else "❌"
         detail = acc["error"] or f"read={acc['read']} write={acc['write']}"
-        print(f"  {mark} {repo}: {detail}")
+        src = f"token={entry['token_src']}" if entry.get("token_src") else "token=default"
+        print(f"  {mark} {repo}: {detail} [{src}]")
     sess = cfg.get("tmux_session", "claude-issues")
     print(f"tmux session '{sess}': {'present' if tmux_session_exists(sess) else 'NOT running'}")
     print(f"SMTP configured: {'yes' if os.environ.get('SMTP_HOST') else 'no (alerts -> alerts.log)'}")
+
+
+def normalize_repos(raw: list) -> list[dict]:
+    """Accept either 'owner/name' strings (served by the default token) or objects
+    {repo, token | token_env} for repos needing a different token. Returns a list of
+    {repo, token, token_src} dicts; token is None for default-token repos."""
+    out = []
+    for item in raw:
+        if isinstance(item, str):
+            out.append({"repo": item, "token": None, "token_src": None})
+            continue
+        if not isinstance(item, dict) or not item.get("repo"):
+            sys.exit(f"error: invalid repo entry (need a string or {{'repo': ...}}): {item!r}")
+        repo = item["repo"]
+        token, src = None, None
+        if item.get("token_env"):
+            src = f"env:{item['token_env']}"
+            token = os.environ.get(item["token_env"])
+            if not token:
+                sys.exit(f"error: token_env '{item['token_env']}' for repo {repo} "
+                         f"is not set in the environment")
+        elif item.get("token"):
+            src = "inline"
+            token = item["token"]
+        out.append({"repo": repo, "token": token, "token_src": src})
+    return out
 
 
 def load_cfg(path: Path) -> dict:
@@ -335,6 +423,7 @@ def load_cfg(path: Path) -> dict:
     cfg.setdefault("poll_interval", 60)
     if not cfg.get("repos"):
         sys.exit("error: config has no 'repos' list")
+    cfg["repos"] = normalize_repos(cfg["repos"])
     return cfg
 
 
@@ -354,17 +443,17 @@ def main():
         cmd_check(cfg)
         return
 
-    owner_login = authed_login()
     state = load_state()
-    log(f"poller starting (session='{cfg['tmux_session']}', repos={cfg['repos']}, "
-        f"interval={cfg['poll_interval']}s, owner='{owner_login}', dry_run={DRY_RUN})")
+    repo_names = [e["repo"] for e in cfg["repos"]]  # never log tokens
+    log(f"poller starting (session='{cfg['tmux_session']}', repos={repo_names}, "
+        f"interval={cfg['poll_interval']}s, default_owner='{login_for(None)}', dry_run={DRY_RUN})")
 
     if args.once:
-        poll_once(cfg, state, owner_login)
+        poll_once(cfg, state)
         return
     try:
         while True:
-            poll_once(cfg, state, owner_login)
+            poll_once(cfg, state)
             time.sleep(cfg["poll_interval"])
     except KeyboardInterrupt:
         log("stopped")
