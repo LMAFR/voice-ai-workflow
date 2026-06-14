@@ -45,6 +45,7 @@ import subprocess
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
@@ -205,14 +206,35 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._send(404, {"ok": False, "error": "not found"})
 
+    def _read_body(self) -> dict | None:
+        """Accept either a JSON or a form-urlencoded body (iOS Shortcuts can send
+        whichever — "JSON" vs "Form" in Get Contents of URL). Returns a dict or None."""
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            return None
+        raw = self.rfile.read(length) if length > 0 else b""
+        if not raw:
+            return {}
+        text = raw.decode("utf-8", "replace").strip()
+        ctype = self.headers.get("Content-Type", "").split(";")[0].strip().lower()
+        if ctype == "application/json" or text[:1] in "{[":
+            try:
+                data = json.loads(text)
+                return data if isinstance(data, dict) else None
+            except json.JSONDecodeError:
+                return None
+        # form-urlencoded (phrase=...&secret=...)
+        parsed = parse_qs(text, keep_blank_values=True)
+        return {k: v[0] for k, v in parsed.items()} if parsed else None
+
     def do_POST(self):
         if self.path != "/issue":
             return self._send(404, {"ok": False, "error": "not found"})
-        try:
-            length = int(self.headers.get("Content-Length", 0))
-            payload = json.loads(self.rfile.read(length) or b"{}")
-        except (ValueError, json.JSONDecodeError):
-            return self._send(400, {"ok": False, "error": "invalid JSON body"})
+        payload = self._read_body()
+        if payload is None:
+            return self._send(400, {"ok": False,
+                                    "error": "body must be JSON or form-encoded with phrase + secret"})
 
         given = str(payload.get("secret", ""))
         if not self.secret or not hmac.compare_digest(given, self.secret):
